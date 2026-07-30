@@ -1,0 +1,234 @@
+name: Harbor Runtime E2E
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harbor-runtime-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Record runtime and verify Docker
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence dist tasks/harbor-runtime-smoke/{environment,solution,tests}
+          python --version | tee evidence/python-version.txt
+          docker version | tee evidence/docker-version.txt
+          docker compose version | tee evidence/docker-compose-version.txt
+
+      - name: Download and verify official Harbor wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip download --no-deps 'harbor==0.6.6' --dest dist
+          WHEEL='dist/harbor-0.6.6-py3-none-any.whl'
+          test -f "$WHEEL"
+          echo '30477bf698d6853d6c4bb76d85aec85e1e95190ad3a6e4bf4730435926007652  '"$WHEEL" | sha256sum -c - | tee evidence/wheel-checksum.txt
+          sha256sum "$WHEEL" > evidence/SHA256SUMS.txt
+          python -m pip install "$WHEEL"
+          python -m pip freeze > evidence/pip-freeze.txt
+          harbor --help > evidence/harbor-help.txt
+          harbor run --help > evidence/harbor-run-help.txt
+
+      - name: Create deterministic Harbor task and local agent
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > tasks/harbor-runtime-smoke/instruction.md <<'EOF'
+          # Harbor runtime smoke task
+
+          Create `/app/answer.txt` containing exactly `HARBOR_RUNTIME_OK` with no trailing newline or whitespace.
+          EOF
+
+          cat > tasks/harbor-runtime-smoke/task.toml <<'EOF'
+          version = "1.0"
+
+          [metadata]
+          author_name = "OpenAI runtime verification"
+          author_email = "noreply@example.com"
+          difficulty_explanation = "Deterministic file-state task used to verify the complete Harbor lifecycle."
+          category = "software-engineering"
+          tags = ["harbor", "runtime", "e2e"]
+
+          [verifier]
+          timeout_sec = 120.0
+
+          [agent]
+          timeout_sec = 120.0
+
+          [environment]
+          build_timeout_sec = 600.0
+          cpus = 1
+          memory_mb = 1024
+          storage_mb = 2048
+          EOF
+
+          cat > tasks/harbor-runtime-smoke/environment/Dockerfile <<'EOF'
+          FROM ubuntu:24.04
+          WORKDIR /app
+          EOF
+
+          cat > tasks/harbor-runtime-smoke/solution/solve.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          mkdir -p /app
+          printf '%s' 'HARBOR_RUNTIME_OK' > /app/answer.txt
+          EOF
+
+          cat > tasks/harbor-runtime-smoke/tests/test.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+          mkdir -p /logs/verifier
+          expected='HARBOR_RUNTIME_OK'
+          if [ -f /app/answer.txt ] && [ "$(cat /app/answer.txt)" = "$expected" ] && [ "$(wc -c < /app/answer.txt)" -eq 17 ]; then
+            printf '1\n' > /logs/verifier/reward.txt
+            printf 'PASS: exact answer artifact verified\n'
+            exit 0
+          fi
+          printf '0\n' > /logs/verifier/reward.txt
+          printf 'FAIL: /app/answer.txt missing or incorrect\n' >&2
+          exit 1
+          EOF
+
+          chmod +x tasks/harbor-runtime-smoke/solution/solve.sh tasks/harbor-runtime-smoke/tests/test.sh
+
+          cat > local_script_agent.py <<'PY'
+          from typing import override
+          from harbor.agents.base import BaseAgent
+          from harbor.environments.base import BaseEnvironment
+          from harbor.models.agent.context import AgentContext
+
+
+          class LocalScriptAgent(BaseAgent):
+              @staticmethod
+              @override
+              def name() -> str:
+                  return "local-script-agent"
+
+              @override
+              def version(self) -> str:
+                  return "1.0.0"
+
+              @override
+              async def setup(self, environment: BaseEnvironment) -> None:
+                  return None
+
+              @override
+              async def run(
+                  self,
+                  instruction: str,
+                  environment: BaseEnvironment,
+                  context: AgentContext,
+              ) -> None:
+                  result = await environment.exec(
+                      command="mkdir -p /app && printf '%s' 'HARBOR_RUNTIME_OK' > /app/answer.txt"
+                  )
+                  if result.return_code != 0:
+                      raise RuntimeError(
+                          f"LocalScriptAgent failed with exit code {result.return_code}: {result.stderr}"
+                      )
+          PY
+
+      - name: Run actual Harbor Oracle trial
+        shell: bash
+        run: |
+          set -euxo pipefail
+          harbor run \
+            -p tasks/harbor-runtime-smoke \
+            -a oracle \
+            -o jobs \
+            --job-name oracle-runtime \
+            -n 1 \
+            --debug 2>&1 | tee evidence/oracle-console.log
+
+      - name: Run actual Harbor custom-agent trial
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          harbor run \
+            -p tasks/harbor-runtime-smoke \
+            --agent-import-path local_script_agent:LocalScriptAgent \
+            -o jobs \
+            --job-name script-agent-runtime \
+            -n 1 \
+            --debug 2>&1 | tee evidence/script-agent-console.log
+
+      - name: Validate persisted Harbor evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = {"harbor_version": "0.6.6", "jobs": {}}
+          for job_name in ("oracle-runtime", "script-agent-runtime"):
+              job_dir = Path("jobs") / job_name
+              job_result_path = job_dir / "result.json"
+              assert job_result_path.exists(), f"missing {job_result_path}"
+              job_result = json.loads(job_result_path.read_text())
+              trial_paths = [p for p in job_dir.rglob("result.json") if p != job_result_path]
+              assert trial_paths, f"no trial result under {job_dir}"
+              trials = []
+              for trial_path in trial_paths:
+                  trial = json.loads(trial_path.read_text())
+                  assert trial.get("exception_info") is None, trial.get("exception_info")
+                  verifier = trial.get("verifier_result")
+                  assert verifier is not None, f"missing verifier_result in {trial_path}"
+                  rewards = verifier.get("rewards") or {}
+                  assert float(rewards.get("reward", 0)) == 1.0, rewards
+                  trials.append({
+                      "path": str(trial_path),
+                      "trial_name": trial.get("trial_name"),
+                      "agent": (trial.get("agent_info") or {}).get("name"),
+                      "rewards": rewards,
+                      "task_checksum": trial.get("task_checksum"),
+                  })
+              lock_path = job_dir / "lock.json"
+              config_path = job_dir / "config.json"
+              assert lock_path.exists(), f"missing {lock_path}"
+              assert config_path.exists(), f"missing {config_path}"
+              summary["jobs"][job_name] = {
+                  "job_result": str(job_result_path),
+                  "lock": str(lock_path),
+                  "config": str(config_path),
+                  "trials": trials,
+              }
+
+          Path("evidence/runtime-summary.json").write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
+          find jobs -maxdepth 4 -type f -print | sort | tee evidence/job-file-manifest.txt
+          find tasks/harbor-runtime-smoke -type f -print0 | sort -z | xargs -0 sha256sum > evidence/task-SHA256SUMS.txt
+          test "$(grep -R --include='reward.txt' -h '^1$' jobs | wc -l)" -ge 2
+
+      - name: Upload complete runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-runtime-e2e-evidence
+          path: |
+            evidence/
+            jobs/
+            tasks/harbor-runtime-smoke/
+            local_script_agent.py
+            dist/harbor-0.6.6-py3-none-any.whl
+          if-no-files-found: error
+          retention-days: 7
