@@ -1,0 +1,66 @@
+name: Harbor Portable Wheelhouse
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheelhouse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download complete Harbor dependency closure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p wheelhouse evidence-wheelhouse
+          python --version | tee evidence-wheelhouse/python-version.txt
+          python -m pip install --upgrade pip
+          python -m pip download 'harbor==0.6.6' --dest wheelhouse
+          test -f wheelhouse/harbor-0.6.6-py3-none-any.whl
+          echo '30477bf698d6853d6c4bb76d85aec85e1e95190ad3a6e4bf4730435926007652  wheelhouse/harbor-0.6.6-py3-none-any.whl' | sha256sum -c - | tee evidence-wheelhouse/harbor-wheel-checksum.txt
+          find wheelhouse -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > evidence-wheelhouse/WHEELHOUSE-SHA256SUMS.txt
+          find wheelhouse -maxdepth 1 -type f -printf '%f\n' | sort > evidence-wheelhouse/wheelhouse-manifest.txt
+          du -sh wheelhouse | tee evidence-wheelhouse/wheelhouse-size.txt
+
+      - name: Verify fully offline installation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv offline-venv
+          offline-venv/bin/pip install --no-index --find-links wheelhouse 'harbor==0.6.6'
+          offline-venv/bin/python - <<'PY' | tee evidence-wheelhouse/import-check.txt
+          import importlib.metadata as metadata
+          import harbor
+          from harbor.job import Job
+          from harbor.trial.queue import TrialQueue
+          print('harbor_version=', metadata.version('harbor'))
+          print('harbor_module=', harbor.__file__)
+          print('Job=', Job)
+          print('TrialQueue=', TrialQueue)
+          PY
+          offline-venv/bin/harbor --help > evidence-wheelhouse/harbor-help.txt
+          offline-venv/bin/harbor run --help > evidence-wheelhouse/harbor-run-help.txt
+          offline-venv/bin/pip freeze > evidence-wheelhouse/offline-pip-freeze.txt
+
+      - name: Upload portable wheelhouse
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-0.6.6-python313-wheelhouse
+          path: |
+            wheelhouse/
+            evidence-wheelhouse/
+          if-no-files-found: error
+          retention-days: 7
