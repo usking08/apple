@@ -1,0 +1,35 @@
+name: Fetch Sudiprokaya translation evidence
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-translation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact translation JSON
+        env:
+          TRANSLATION_URL: 'https://appdeployai-v2-storage.s3.us-east-1.amazonaws.com/be14cbca872360fea5/qa_97bf155175f2/translations/latest.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIAYJE2XSHQIOAQKQGI%2F20260730%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260730T162222Z&X-Amz-Expires=868&X-Amz-Security-Token=IQoJb3JpZ2luX2VjENH%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCXVzLWVhc3QtMSJHMEUCIH3t3IOVALPnEwjaH0jCGh4yXU0XlkArdCu4MlbUwxXWAiEAksmX7nSLz%2Fep9aEs9HUnAFpYH12lwLfwguRlhuGs2Woq0gIImf%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FARAAGgw1Njk0MDc2NzI4MDAiDDxaas%2BjUW%2BGLCWsayqmAi%2B7hOUlqTygXyEpQP3mxO11UFPeT7ZoXsLnS1LuOmQCKb9rKTfVGwrxhZNnJmQopxZa068S%2BXzVHA62SdGitUDyoBIZiwP%2FyuoUdbKZAD98svaj4DVKmdKNf4VmNzqm97BXU9Q7dli%2B51T1mvMV6sI3qP%2FnPnfUyEhpUBr%2BZJtshUoQ%2BxueX3gkHtlXY24fLFgvv7O0F0%2BezqS9YZ9z2eQrFd%2BPdQcwN8z%2FcXVulgdU69juU68oiE90oDLo6dvQ2tr79%2FR7UFhgyQrwDA766Y1ZXkqodVNJWrbnU5d%2FmDpD8UNrdIjrbfUiISmEwe%2BX2JO%2FYTLKEbBkJw9bj%2Fcd3AEeylTro38ithRwAqiBgJn6pUbStHj0VKnXJhZQLfSYbxnb9GErkjCf9K3TBjqdAUkomF4mYHLXN7qXHBtVznekFPB3zktL9eur%2BAouOwjg8U1s5Nr3NVTyyc4nUS%2BwW1UmyxvxaREOsCFD3i8IzfvjupkCRdpUeFsl1fRsY%2FUIRDyIlIjPW%2BQMCPWj8ivlVnlEC%2Fhz%2BJbDdAS9kRtMuac2Bn2srbiQ1x5l2Ame4HWtVxFc9CF%2BveLYImWSeL8x2Ogw7olye4wLtQRAvJk%3D&X-Amz-Signature=ab22d4de5d4fa8c9c19b0073734705793679916d271ed8aa3a987aab0de0406a&X-Amz-SignedHeaders=host&response-cache-control=max-age%3D2592000&x-amz-checksum-mode=ENABLED&x-id=GetObject'
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, hashlib
+          url = os.environ['TRANSLATION_URL']
+          data = urllib.request.urlopen(url, timeout=30).read()
+          open('sudiprokaya_translation.json', 'wb').write(data)
+          print('BYTES', len(data))
+          print('SHA256', hashlib.sha256(data).hexdigest())
+          print('BEGIN_TRANSLATION_JSON')
+          print(json.dumps(json.loads(data), ensure_ascii=False, indent=2))
+          print('END_TRANSLATION_JSON')
+          PY
+      - name: Upload exact JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudiprokaya-translation-json
+          path: sudiprokaya_translation.json
+          if-no-files-found: error
