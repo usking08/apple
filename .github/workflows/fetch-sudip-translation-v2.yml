@@ -1,0 +1,45 @@
+name: Decode Sudiprokaya translation evidence
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  decode-translation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and decode exact translation JSON
+        run: |
+          python - <<'PY'
+          import ast, base64, hashlib, json, pathlib, re, urllib.request
+          text = pathlib.Path('.github/workflows/fetch-sudip-translation.yml').read_text()
+          match = re.search(r"TRANSLATION_URL:\s*('.*')", text)
+          if not match:
+              raise SystemExit('signed URL not found')
+          url = ast.literal_eval(match.group(1))
+          stored = urllib.request.urlopen(url, timeout=30).read()
+          try:
+              parsed = json.loads(stored)
+              raw = stored
+          except json.JSONDecodeError:
+              raw = base64.b64decode(stored)
+              parsed = json.loads(raw)
+          pathlib.Path('sudiprokaya_translation.json').write_bytes(raw)
+          print('STORED_BYTES', len(stored))
+          print('JSON_BYTES', len(raw))
+          print('SHA256', hashlib.sha256(raw).hexdigest())
+          print('BEGIN_TRANSLATION_JSON')
+          print(json.dumps(parsed, ensure_ascii=False, indent=2))
+          print('END_TRANSLATION_JSON')
+          PY
+      - name: Upload decoded JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudiprokaya-translation-json-decoded
+          path: sudiprokaya_translation.json
+          if-no-files-found: error
